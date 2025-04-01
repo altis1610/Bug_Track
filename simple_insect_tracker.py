@@ -131,7 +131,7 @@ class SimpleDisturbanceTracker:
                 
                 # 尋找最近的物體
                 for i, obj in enumerate(objects):
-                    if i in matched_objects:
+                    if i in matched_objects: 
                         continue
                         
                     curr_pos = obj['position']
@@ -317,7 +317,8 @@ class SimpleDisturbanceTracker:
 
 
 def process_video(video_path, output_dir=None, min_area=100, max_area=None,
-                 min_movement=50, min_duration_seconds=1.0, display=True):
+                 min_movement=50, min_duration_seconds=1.0, buffer_seconds=1.0, display=True,
+                 progress_callback=None):
     """處理影片並只輸出有檢測到擾動的片段"""
     # 檢查影片路徑
     if not os.path.exists(video_path):
@@ -327,9 +328,9 @@ def process_video(video_path, output_dir=None, min_area=100, max_area=None,
     # 創建輸出目錄
     video_name = Path(video_path).stem
     if output_dir is None:
-        output_dir = Path(video_path).parent / f"{video_name}_disturbances"
+        output_dir = Path(video_path).parent
     else:
-        output_dir = Path(output_dir) / f"{video_name}_disturbances"
+        output_dir = Path(output_dir)
     
     os.makedirs(output_dir, exist_ok=True)
     print(f"輸出目錄: {output_dir}")
@@ -367,22 +368,22 @@ def process_video(video_path, output_dir=None, min_area=100, max_area=None,
     # 處理影片
     print("\n開始處理影片...")
     start_time = time.time()
-    
-    # 根據 display 參數選擇進度顯示方式
-    if display:
-        progress_iter = range(total_frames)
-    else:
-        from tqdm import tqdm
-        progress_iter = tqdm(range(total_frames), desc="Processing", unit="frames")
+    processed_frames = 0
     
     # 用於記錄要保存的幀
     frames_to_save = []
     frame_indices = []
     
-    for _ in progress_iter:
+    # 如果有進度回調，先發送初始進度
+    if progress_callback:
+        progress_callback(video_name, (0, total_frames))
+    
+    while True:
         ret, frame = cap.read()
         if not ret:
             break
+            
+        processed_frames += 1
         
         # 處理幀
         vis_frame, _ = tracker.process_frame(frame)
@@ -405,16 +406,25 @@ def process_video(video_path, output_dir=None, min_area=100, max_area=None,
             cv2.imshow('Tracking', vis_frame)
             if cv2.waitKey(1) & 0xFF == 27:
                 break
+        
+        # 每10幀更新一次進度
+        if processed_frames % 10 == 0:
+            # 顯示詳細進度
+            elapsed = time.time() - start_time
+            fps_processing = processed_frames / elapsed
+            remaining = (total_frames - processed_frames) / fps_processing
+            print(f"處理進度: {processed_frames}/{total_frames} "
+                  f"({processed_frames/total_frames*100:.1f}%) "
+                  f"- 處理速度: {fps_processing:.1f} FPS "
+                  f"- 剩餘時間: {remaining:.1f} 秒")
             
-            # 只在 display=True 時顯示詳細進度
-            if tracker.frame_count % 100 == 0:
-                elapsed = time.time() - start_time
-                fps_processing = tracker.frame_count / elapsed
-                remaining = (total_frames - tracker.frame_count) / fps_processing
-                print(f"處理進度: {tracker.frame_count}/{total_frames} "
-                      f"({tracker.frame_count/total_frames*100:.1f}%) "
-                      f"- 處理速度: {fps_processing:.1f} FPS "
-                      f"- 剩餘時間: {remaining:.1f} 秒")
+            # 回調進度
+            if progress_callback:
+                progress_callback(video_name, (processed_frames, total_frames))
+    
+    # 處理完成時發送最終進度
+    if progress_callback:
+        progress_callback(video_name, (total_frames, total_frames))
     
     # 清理
     cap.release()
@@ -426,14 +436,17 @@ def process_video(video_path, output_dir=None, min_area=100, max_area=None,
     
     # 合併重疊的時間區間
     if valid_insects:
-        intervals = [(d['first_frame'], d['last_frame']) for d in valid_insects]
+        # 將時間從幀數轉換為秒數
+        intervals = [(d['first_frame']/fps, d['last_frame']/fps) for d in valid_insects]
         intervals.sort(key=lambda x: x[0])
         
+        # 合併重疊的時間區間
         merged_intervals = []
         current_start, current_end = intervals[0]
         
         for start, end in intervals[1:]:
-            if start <= current_end + 30:  # 允許30幀的間隔
+            # 如果當前區間的結束時間加上緩衝區與下一個區間的開始時間減去緩衝區有重疊，則合併
+            if start - buffer_seconds <= current_end + buffer_seconds:
                 current_end = max(current_end, end)
             else:
                 merged_intervals.append((current_start, current_end))
@@ -441,13 +454,14 @@ def process_video(video_path, output_dir=None, min_area=100, max_area=None,
         merged_intervals.append((current_start, current_end))
         
         # 使用 ffmpeg 切割影片
-        for i, (start_frame, end_frame) in enumerate(merged_intervals):
-            # 計算時間戳記
-            start_time = start_frame / fps
-            duration = (end_frame - start_frame) / fps
+        for i, (start_time, end_time) in enumerate(merged_intervals):
+            # 加入緩衝時間
+            clip_start = max(0, start - buffer_seconds)
+            clip_end = min(total_frames/fps, end + buffer_seconds)
+            duration = clip_end - clip_start
             
             # 格式化時間戳記為 HH:MM:SS.xxx
-            start_timecode = str(timedelta(seconds=start_time))
+            start_timecode = str(timedelta(seconds=clip_start))
             duration_timecode = str(timedelta(seconds=duration))
             
             # 設定輸出檔案路徑
@@ -459,10 +473,12 @@ def process_video(video_path, output_dir=None, min_area=100, max_area=None,
                 '-i', str(video_path),
                 '-ss', start_timecode,
                 '-t', duration_timecode,
-                '-c:v', 'h264',          # 使用 h264 編碼
-                '-preset', 'ultrafast',   # 最快的編碼速度
-                '-crf', '23',            # 合理的畫質（0-51，越低越好）
-                '-y',                     # 覆寫現有檔案
+                '-c:v', 'libx264',     # 使用 H.264 編碼器
+                '-preset', 'medium',    # 使用中等編碼速度，在速度和質量之間取得平衡
+                '-crf', '18',          # 較低的 CRF 值代表更高的質量（範圍 0-51，18 是很好的質量）
+                '-pix_fmt', 'yuv420p', # 確保更好的相容性
+                '-movflags', '+faststart',  # 支援網頁播放的快速啟動
+                '-y',                    
                 str(segment_path)
             ]
             
@@ -470,9 +486,15 @@ def process_video(video_path, output_dir=None, min_area=100, max_area=None,
             try:
                 subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
                 print(f"已保存片段 {i+1}: {segment_path}")
+                print(f"  時間區間: {clip_start:.2f}s - {clip_end:.2f}s (含緩衝)")
+                print(f"  原始區間: {start_time:.2f}s - {end_time:.2f}s")
             except subprocess.CalledProcessError as e:
                 print(f"處理片段 {i+1} 時發生錯誤: {e}")
                 print(f"FFmpeg 錯誤輸出: {e.stderr.decode()}")
+    
+    # 回調完成進度
+    if progress_callback:
+        progress_callback(video_name, 100)
     
     print(f"\n處理完成! 總幀數: {tracker.frame_count}")
     print(f"檢測到的有效擾動數量: {len(valid_insects)}")
@@ -484,11 +506,11 @@ def process_video(video_path, output_dir=None, min_area=100, max_area=None,
         'segments': [
             {
                 'path': str(output_dir / f"{video_name}_segment_{i+1}.mp4"),
-                'start_frame': start,
-                'end_frame': end,
-                'start_time': start/fps,
-                'end_time': end/fps,
-                'duration': (end-start)/fps
+                'start_time_with_buffer': max(0, start - buffer_seconds),
+                'end_time_with_buffer': min(total_frames/fps, end + buffer_seconds),
+                'original_start_time': start,
+                'original_end_time': end,
+                'duration': min(total_frames/fps, end + buffer_seconds) - max(0, start - buffer_seconds)
             }
             for i, (start, end) in enumerate(merged_intervals)
         ],
@@ -499,7 +521,8 @@ def process_video(video_path, output_dir=None, min_area=100, max_area=None,
             'min_area': min_area,
             'max_area': max_area,
             'min_movement': min_movement,
-            'min_duration_seconds': min_duration_seconds
+            'min_duration_seconds': min_duration_seconds,
+            'buffer_seconds': buffer_seconds
         },
         'disturbances': valid_insects
     }
@@ -522,6 +545,7 @@ if __name__ == "__main__":
     max_area = None  # 最大物體面積 (像素，預設為影像面積的1/20)
     min_movement = 200  # 最小移動距離
     min_duration = 1.0  # 最短持續時間 (秒)
+    buffer_seconds = 1.0  # 每個片段前後要預留的緩衝時間 (秒)
     display = False  # 是否顯示處理過程
 
     process_video(
@@ -531,5 +555,6 @@ if __name__ == "__main__":
         max_area=max_area,
         min_movement=min_movement,
         min_duration_seconds=min_duration,
+        buffer_seconds=buffer_seconds,
         display=display
     )
