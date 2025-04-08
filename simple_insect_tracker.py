@@ -435,29 +435,30 @@ def process_video(video_path, output_dir=None, min_area=100, max_area=None,
     valid_insects = tracker.get_valid_insects()
     
     # 合併重疊的時間區間
+    merged_intervals = []
     if valid_insects:
         # 將時間從幀數轉換為秒數
         intervals = [(d['first_frame']/fps, d['last_frame']/fps) for d in valid_insects]
         intervals.sort(key=lambda x: x[0])
         
         # 合併重疊的時間區間
-        merged_intervals = []
-        current_start, current_end = intervals[0]
-        
-        for start, end in intervals[1:]:
-            # 如果當前區間的結束時間加上緩衝區與下一個區間的開始時間減去緩衝區有重疊，則合併
-            if start - buffer_seconds <= current_end + buffer_seconds:
-                current_end = max(current_end, end)
-            else:
-                merged_intervals.append((current_start, current_end))
-                current_start, current_end = start, end
-        merged_intervals.append((current_start, current_end))
+        if intervals:  # 確保 intervals 不為空
+            current_start, current_end = intervals[0]
+            
+            for start, end in intervals[1:]:
+                # 如果當前區間的結束時間加上緩衝區與下一個區間的開始時間減去緩衝區有重疊，則合併
+                if start - buffer_seconds <= current_end + buffer_seconds:
+                    current_end = max(current_end, end)
+                else:
+                    merged_intervals.append((current_start, current_end))
+                    current_start, current_end = start, end
+            merged_intervals.append((current_start, current_end))
         
         # 使用 ffmpeg 切割影片
         for i, (start_time, end_time) in enumerate(merged_intervals):
             # 加入緩衝時間
-            clip_start = max(0, start - buffer_seconds)
-            clip_end = min(total_frames/fps, end + buffer_seconds)
+            clip_start = max(0, start_time - buffer_seconds)
+            clip_end = min(total_frames/fps, end_time + buffer_seconds)
             duration = clip_end - clip_start
             
             # 格式化時間戳記為 HH:MM:SS.xxx
@@ -494,7 +495,7 @@ def process_video(video_path, output_dir=None, min_area=100, max_area=None,
     
     # 回調完成進度
     if progress_callback:
-        progress_callback(video_name, 100)
+        progress_callback(video_name, (total_frames, total_frames))
     
     print(f"\n處理完成! 總幀數: {tracker.frame_count}")
     print(f"檢測到的有效擾動數量: {len(valid_insects)}")
@@ -506,13 +507,13 @@ def process_video(video_path, output_dir=None, min_area=100, max_area=None,
         'segments': [
             {
                 'path': str(output_dir / f"{video_name}_segment_{i+1}.mp4"),
-                'start_time_with_buffer': max(0, start - buffer_seconds),
-                'end_time_with_buffer': min(total_frames/fps, end + buffer_seconds),
-                'original_start_time': start,
-                'original_end_time': end,
-                'duration': min(total_frames/fps, end + buffer_seconds) - max(0, start - buffer_seconds)
+                'start_time_with_buffer': max(0, start_time - buffer_seconds),
+                'end_time_with_buffer': min(total_frames/fps, end_time + buffer_seconds),
+                'original_start_time': start_time,
+                'original_end_time': end_time,
+                'duration': min(total_frames/fps, end_time + buffer_seconds) - max(0, start_time - buffer_seconds)
             }
-            for i, (start, end) in enumerate(merged_intervals)
+            for i, (start_time, end_time) in enumerate(merged_intervals)
         ],
         'total_frames': tracker.frame_count,
         'fps': fps,
